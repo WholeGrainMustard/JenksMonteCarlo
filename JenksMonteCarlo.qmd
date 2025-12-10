@@ -1,0 +1,359 @@
+---
+title: "Efficient Classification"
+author: "Alton Hipps"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    toc-location: left
+    embed-resources: true
+    html-math-method: mathjax
+editor: visual
+---
+
+## Import requisite
+
+```{r}
+library(tidyverse)
+library(microbenchmark)
+library(tictoc)
+library(simhelpers)
+```
+
+## Data Generation
+
+```{r}
+createData <- function(N=100,lowVal=1, highVal=100, percision=0.1){
+  newHigh <- highVal*(1/percision)
+  ds <- sort(sample(lowVal:newHigh, size=N, replace=TRUE)*percision)
+  ids <- 1:N
+  return(data.frame('id'=ids,'data'=ds))
+}
+
+ds <- createData()
+plot(ds)
+```
+
+## Classification Methods
+
+```{r}
+jenksClass <- function(inDat, k=3){
+  inDat$class<-classInt::classify_intervals(inDat$data,k,'jenks',
+                                            factor = FALSE, largeN=5001)
+  return(inDat)
+}
+
+percJenksClass <- function(inDat, k=3, percentiles=10){
+  percs <- quantile(inDat$data, probs = seq(0, 1, (100/percentiles)/100))
+  classes <- classInt::classify_intervals(percs,k,'jenks',factor = FALSE)
+  pairings <- data.frame('perc'=percs,'class'=classes)
+  lowVals=c()
+  oldClass=0
+  for (i in 1:length(pairings$class)){
+    pair <- pairings[i,]
+    if (pair$class != oldClass){
+      lowVals=c(lowVals,unname(pair$perc))
+      oldClass <- pair$class
+    }
+  }
+  inDat$class <- rep(0,length(inDat$data))
+  
+  lowVals=c(lowVals,max(inDat$data)+1)
+  
+  for (i in 1:(length(lowVals)-1)){
+    low = lowVals[i]
+    high = lowVals[i+1]
+    
+    inDat <- inDat %>%
+      mutate(class=ifelse(data>=low & data<high,i,class))
+  }
+  return(inDat)
+}
+
+data=createData(N=5000)
+ds<-jenksClass(data)
+ds2<-percJenksClass(data)
+
+ggplot(data=arrange(ds,desc(data)))+
+  geom_point(aes(x=id,y=data,color=factor(class)))
+  
+ggplot(data=arrange(ds2,desc(data)))+
+  geom_point(aes(x=id,y=data,color=factor(class)))
+```
+
+## Classify both ways and output result
+
+```{r}
+classifyAndAnalyize <- function(inDat, k=5, percentiles=10){
+  
+  jenksTime <- microbenchmark(
+    ds<-jenksClass(inDat, k=k), times=1)
+  percTime <- microbenchmark(
+    ds2<-percJenksClass(inDat, k=k, percentiles = percentiles), times=1)
+  
+  dsCombo <- merge(x=ds,y=ds2,by='id') %>%
+    subset(select = -c(data.y))
+  dsCombo$same <- ifelse(dsCombo$class.x==dsCombo$class.y,TRUE,FALSE)
+  cohenK <- irr::kappa2(dsCombo[ , c('class.x', 'class.y')])
+
+  return(data.frame(
+    'Cohens Kappa'= cohenK$value,
+    #'Cohens Kappa P'= cohenK$p.value,
+    'Percent Same'= mean(dsCombo$same),
+    'Jenks Time'= jenksTime$time/1000000,
+    'Percentile Time'= percTime$time/1000000
+  ))
+}
+tic()
+ds <- classifyAndAnalyize(createData(N=100))
+toc()
+```
+
+## Create simulation driver function
+
+```{r}
+runSim <- bundle_sim(
+  f_generate = createData,
+  f_analyze = classifyAndAnalyize,
+  id = "rep"
+)
+tic()
+testRun <- runSim(rep=10,N=100,k=3)
+toc()
+```
+
+```{r}
+set.seed(20251204)
+
+params <- expand.grid(list(
+  N=c(50,100,1000,5000),
+  k=c(3,5,7),
+  percentiles = c(5,10,50,100)
+))
+
+params <- subset(params, N > percentiles)
+print(params)
+
+tic()
+params$res <- pmap(
+  params, # data.frame of parameters
+  runSim, # simulation driver
+  reps = 100,
+  .progress = TRUE
+)
+toc()
+
+df <- params %>% unnest(res)
+```
+
+```{r}
+save(df, file = "randomSamp_Data.Rdata")
+```
+
+## Skewed Distribution
+
+```{r}
+createSkewedData <- function(N=1000, rate=0.05){
+  ids <- 1:N
+  return(data.frame('id'=ids,'data'=rexp(N, rate)))
+}
+
+hist(createSkewedData()$data)
+```
+
+```{r}
+runSkewedSim <- bundle_sim(
+  f_generate = createSkewedData,
+  f_analyze = classifyAndAnalyize,
+  id = "rep"
+)
+
+tic()
+testRun <- runSkewedSim(rep=10,N=100,k=3)
+toc()
+```
+
+```{r}
+set.seed(20251204)
+
+params <- expand.grid(list(
+  N=c(50,100,1000,5000),
+  k=c(3,5,7),
+  percentiles = c(5,10,50,100)
+))
+
+params <- subset(params, N > percentiles)
+print(params)
+
+tic()
+params$res <- pmap(
+  params, # data.frame of parameters
+  runSkewedSim, # simulation driver
+  reps = 100,
+  .progress = TRUE
+)
+toc()
+
+dfSkew <- params %>% unnest(res)
+```
+
+```{r}
+save(dfSkew, file = "skewedSamp_Data.Rdata")
+```
+
+## Data Processing
+
+```{r}
+load(file="randomSamp_Data.Rdata")
+load(file="skewedSamp_Data.Rdata")
+```
+
+```{r}
+ggplot(data=df)+
+   geom_histogram(binwidth = .05, aes(x=Cohens.Kappa))+
+  facet_grid(rows = vars(N), cols = vars(k))
+ggsave('kappaHist_random.svg')
+
+ggplot(data=dfSkew)+
+   geom_histogram(binwidth = .05, fill='#aa1177', aes(x=Cohens.Kappa))+
+  facet_grid(rows = vars(N), cols = vars(k))
+ggsave('kappaHist_skew.svg')
+```
+
+```{r}
+sum_df <- df %>%
+  group_by(N,k,percentiles) %>%
+  summarise(avg = mean(Cohens.Kappa),var=var(Cohens.Kappa))
+
+ggplot(data=sum_df)+
+  geom_col(mapping = aes(x=factor(percentiles),y=avg))+
+  geom_errorbar(aes(x=factor(percentiles),ymin=avg-var,ymax=avg+var))+
+  facet_grid(rows = vars(N), cols=vars(k))+ 
+  theme_light()
+ggsave('kappa_random.svg')
+
+sum_df_skew <- dfSkew %>%
+  group_by(N,k,percentiles) %>%
+  summarise(avg = mean(Cohens.Kappa),var=var(Cohens.Kappa))
+
+ggplot(data=sum_df_skew)+
+  geom_col(mapping = aes(x=factor(percentiles), y=avg),fill='#aa1177')+
+  geom_errorbar(aes(x=factor(percentiles), ymin=avg-var, ymax=avg+var))+
+  facet_grid(rows = vars(N), cols=vars(k))+ 
+  theme_light()
+ggsave('kappa_skew.svg')
+```
+
+```{r}
+df$KappaXTime <- df$Cohens.Kappa*df$timeSaved
+above.9 <- nrow(subset(df, Cohens.Kappa>0.9))/nrow(df)
+above.8 <- nrow(subset(df, Cohens.Kappa>0.8))/nrow(df)
+above.6 <- nrow(subset(df, Cohens.Kappa>0.6))/nrow(df)
+lowKappa<-subset(df, Cohens.Kappa<0.6)
+```
+
+```{r}
+df$timeSaved=(df$Jenks.Time-df$Percentile.Time)
+dfSkew$timeSaved=(dfSkew$Jenks.Time-dfSkew$Percentile.Time)
+
+ggplot(data=df)+
+  geom_boxplot((aes(x=factor(N),y=timeSaved)))+
+  #scale_y_log10()+
+  facet_grid(rows=vars(k), cols=vars(percentiles))+
+  labs(title='Random Distro')+
+  ylim(-200, 31500)+
+  theme_light()
+ggsave('time_random.svg')
+
+ggplot(data=dfSkew)+
+  geom_boxplot(aes(x=factor(N),y=timeSaved),color='#aa1177')+
+  #scale_y_log10()+
+  facet_grid(rows=vars(k), cols=vars(percentiles))+
+  labs(title='Skewed Distro')+
+  ylim(-200, 31500)+ 
+  theme_light()
+ggsave('time_skew.svg')
+```
+
+```{r}
+ggplot(data=df)+
+  geom_point(aes(x=Cohens.Kappa, y=timeSaved, color=factor(k)))+
+  facet_grid(rows=vars(N))
+
+ggplot(data=dfSkew)+
+  geom_point(aes(x=Cohens.Kappa, y=timeSaved, color=factor(k)))+
+  facet_grid(rows=vars(N))
+```
+
+### Linear Regression
+
+```{r}
+df$kappaScaled <- (1+df$Cohens.Kappa)/2
+dfSkew$kappaScaled <- (1+dfSkew$Cohens.Kappa)/2
+
+model_glm2 <- glm2::glm2(kappaScaled ~ N+k+percentiles, 
+                   family='binomial',data=df)
+model_glm2_skew <- glm2::glm2(kappaScaled ~ N+k+percentiles, 
+                   family='binomial',data=dfSkew)
+
+deviance <- summary(model_glm2)$deviance
+null_deviance <- summary(model_glm2)$null.deviance
+rsquared <- 1 - (deviance / null_deviance)
+print(rsquared)
+
+deviance <- summary(model_glm2_skew)$deviance
+null_deviance <- summary(model_glm2_skew)$null.deviance
+rsquared <- 1 - (deviance / null_deviance)
+print(rsquared)
+
+coefs=data.frame(model_glm2$coefficients)
+coefs$indexes <- row.names(coefs)
+print(coefs)
+
+coefs=data.frame(model_glm2_skew$coefficients)
+coefs$indexes <- row.names(coefs)
+print(coefs)
+
+ggplot(data=coefs)+
+  geom_col(mapping=aes(y=abs(model_glm2$coefficients),x=indexes))
+
+ggplot(data=coefs)+
+  geom_col(mapping=aes(y=abs(model_glm2_skew$coefficients),x=indexes))
+```
+
+```{r}
+# Normalize Time on scale from 0-1
+df$Jenks.Time.Normal <- df$Jenks.Time/max(df$Jenks.Time)
+df$Percentile.Time.Normal <- df$Percentile.Time/max(df$Percentile.Time)
+dfSkew$Jenks.Time.Normal <- dfSkew$Jenks.Time/max(dfSkew$Jenks.Time)
+dfSkew$Percentile.Time.Normal <- dfSkew$Percentile.Time/max(dfSkew$Percentile.Time)
+
+model_glm2 <- glm2::glm2(Jenks.Time.Normal ~ N+k+percentiles, 
+                   family='binomial',data=df)
+model_glm2_skew <- glm2::glm2(Jenks.Time.Normal ~ N+k+percentiles, 
+                   family='binomial',data=dfSkew)
+
+deviance <- summary(model_glm2)$deviance
+null_deviance <- summary(model_glm2)$null.deviance
+rsquared <- 1 - (deviance / null_deviance)
+print(rsquared)
+
+deviance <- summary(model_glm2_skew)$deviance
+null_deviance <- summary(model_glm2_skew)$null.deviance
+rsquared <- 1 - (deviance / null_deviance)
+print(rsquared)
+
+coefs=data.frame(model_glm2$coefficients)
+coefs$indexes <- row.names(coefs)
+print(coefs)
+
+coefs=data.frame(model_glm2_skew$coefficients)
+coefs$indexes <- row.names(coefs)
+print(coefs)
+
+ggplot(data=coefs)+
+  geom_col(mapping=aes(y=abs(model_glm2$coefficients),x=indexes))
+
+ggplot(data=coefs)+
+  geom_col(mapping=aes(y=abs(model_glm2_skew$coefficients),x=indexes))
+```
